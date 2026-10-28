@@ -114,9 +114,19 @@ class TestCompare:
     def test_unrelated_name_disagrees(self, levels: pd.DataFrame) -> None:
         assert levels.loc[("Q3", "E1"), "name"] == 1
 
-    def test_tf_recorded_only_for_exact_agreement(self, levels: pd.DataFrame) -> None:
+    def test_tf_is_the_reference_value_on_exact_agreement(self, levels: pd.DataFrame) -> None:
+        # "acme widgets" is held by 1 of the 4 entities
         assert levels.loc[("Q1", "E1"), "tf_name"] == pytest.approx(0.25)
-        assert np.isnan(levels.loc[("Q3", "E1"), "tf_name"])
+
+    def test_tf_is_also_recorded_on_a_fuzzy_agreement(self, levels: pd.DataFrame) -> None:
+        # Q2's own string is held by nobody; the tf is the entity value it came close to
+        top = next(c for c in mt.COMPARISONS if c.attr == "name").n_levels - 1
+        assert 2 <= levels.loc[("Q2", "E1"), "name"] < top
+        assert levels.loc[("Q2", "E1"), "tf_name"] == pytest.approx(0.25)
+
+    def test_tf_is_absent_when_nothing_was_agreed_on(self, levels: pd.DataFrame) -> None:
+        assert np.isnan(levels.loc[("Q3", "E1"), "tf_name"])   # disagree
+        assert np.isnan(levels.loc[("Q1", "E3"), "tf_address"])  # null
 
 
 class TestValueTf:

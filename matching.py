@@ -168,7 +168,9 @@ def compare(pairs: pd.DataFrame, q: pd.DataFrame, e: pd.DataFrame, tf: pd.DataFr
     :param tf: output of :func:`value_tf`
     :param comparisons: comparison definitions
     :return: ``pairs`` plus one level column per attribute and a ``tf_<attr>``
-        column holding the rarest exactly-agreeing value's tf (NaN otherwise)
+        column holding the tf of the reference value the pair agreed on. Where
+        several reference values reach the pair's level, the rarest is used.
+        NaN when the level is null or disagree, where nothing was agreed on
     """
     out = pairs[["qid", "eid"]].reset_index(drop=True).copy()
     for c in comparisons:
@@ -186,9 +188,14 @@ def compare(pairs: pd.DataFrame, q: pd.DataFrame, e: pd.DataFrame, tf: pd.DataFr
         best = x.groupby(["qid", "eid"]).lev.max().rename(c.attr)
         out = out.merge(best, on=["qid", "eid"], how="left")
         out[c.attr] = out[c.attr].fillna(0).astype(np.int8)
-        # tf of the rarest exactly agreeing value
-        xe = x[exact].merge(tf[tf.attr_type == c.attr][["norm", "tf"]], left_on="qv", right_on="norm")
-        rare = xe.groupby(["qid", "eid"]).tf.min().rename(f"tf_{c.attr}")
+        # tf of the rarest reference value that reaches the pair's level. the
+        # reference side is the one that can be counted: at the exact level it
+        # is the shared value, at a fuzzy level the query's own string is held
+        # by nobody, so there would be nothing to count on that side
+        xa = x.merge(best, on=["qid", "eid"])
+        xa = xa[(xa.lev.values == xa[c.attr].values) & (xa.lev.values >= 2)]
+        xa = xa.merge(tf[tf.attr_type == c.attr][["norm", "tf"]], left_on="ev", right_on="norm")
+        rare = xa.groupby(["qid", "eid"]).tf.min().rename(f"tf_{c.attr}")
         out = out.merge(rare, on=["qid", "eid"], how="left")
     return out
 
@@ -344,18 +351,29 @@ def score(levels: pd.DataFrame, m: dict, u: dict, n_entities: int | None = None,
     """
     Sum per-attribute log2 weights.
 
-    With ``use_tf``, the exact level's u is replaced by a value-specific u:
+    With ``use_tf``, every agreement level's u is replaced by a value-specific
+    u built from the reference value the pair agreed on:
 
-    ``u_v = max((count_v - 1) / N, u_exact)``
+    ``u_v(k) = max((count_v - 1) / N, u_k)``
 
     ``count_v - 1`` is the number of *other* entities holding the value if the
     query's own entity is one of the holders, so a value held by 240 entities
     is nearly worthless and one held by 2 leaves a two-way tie. A unique
-    value gives 0, so it falls back to ``u_exact``, the rate at which two
-    distinct entities coincide on this attribute. Using ``count_v / N``
-    (the textbook tf) would put a floor of 1/N on every agreement, which is
-    far too high for attributes such as name where distinct entities almost
-    never coincide.
+    value gives 0, so it falls back to ``u_k``, the rate at which two distinct
+    entities coincide at that level. Using ``count_v / N`` (the textbook tf)
+    would put a floor of 1/N on every agreement, which is far too high for
+    attributes such as name where distinct entities almost never coincide.
+
+    The monotone cap of :func:`level_weights` then has to be applied per pair
+    rather than per attribute, because the substitution can reorder the
+    levels. Agreeing exactly on a value is at least as strong as agreeing
+    approximately on it, so a pair at level ``l`` on value ``v`` is capped at
+    what exact agreement on that same ``v`` would earn:
+
+    ``w(l, v) = min over k >= l of log2(m_k / u_v(k))``
+
+    Without this, a near miss on an address held by 240 entities outscores an
+    exact hit on it, because the near miss keeps the undiscounted fuzzy u.
 
     :param levels: comparison vectors (with ``tf_<attr>`` columns)
     :param m: match level distributions
@@ -377,11 +395,17 @@ def score(levels: pd.DataFrame, m: dict, u: dict, n_entities: int | None = None,
         g = out[c.attr].values.astype(int)
         w = lw[c.attr][g]
         if use_tf and c.tf:
-            top = c.n_levels - 1
             tfv = out[f"tf_{c.attr}"].values
-            mask = (g == top) & ~np.isnan(tfv)
-            u_v = np.maximum(tfv[mask] - inv_n, u[c.attr][top])
-            w[mask] = np.log2(m[c.attr][top] / u_v)
+            mask = (g >= 2) & ~np.isnan(tfv)
+            if mask.any():
+                lv = g[mask]
+                # (count_v - 1) / N, clamped at 0 for a value only this entity holds
+                others = np.maximum(tfv[mask] - inv_n, 0.0)
+                capped = np.full(lv.shape, np.inf)
+                for k in range(2, c.n_levels):
+                    w_k = np.log2(m[c.attr][k] / np.maximum(others, u[c.attr][k]))
+                    capped = np.where(lv <= k, np.minimum(capped, w_k), capped)
+                w[mask] = capped
         out[f"w_{c.attr}"] = w
         total += w
     out["score"] = total

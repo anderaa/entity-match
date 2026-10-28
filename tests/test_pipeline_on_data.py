@@ -61,6 +61,7 @@ def test_62_every_attribute_is_estimated_in_some_round(run: dict) -> None:
 
 
 def test_5_and_63_score_is_the_sum_of_value_adjusted_weights(run: dict) -> None:
+    """S = sum_a w(gamma_a, v), with 6.3's value-specific u and 6.4's cap applied per pair."""
     s, m, u, n = run["scored"], run["m"], run["u"], run["n"]
     lw = mt.level_weights(m, u)
     total = np.zeros(len(s))
@@ -68,12 +69,32 @@ def test_5_and_63_score_is_the_sum_of_value_adjusted_weights(run: dict) -> None:
         lv = s[c.attr].values.astype(int)
         w = lw[c.attr][lv].copy()
         if c.tf:
-            top = c.n_levels - 1
             count = s[f"tf_{c.attr}"].values * n
-            hit = (lv == top) & ~np.isnan(count)
-            w[hit] = np.log2(m[c.attr][top] / np.maximum((count[hit] - 1) / n, u[c.attr][top]))
+            hit = (lv >= 2) & ~np.isnan(count)
+            others = np.maximum((count[hit] - 1) / n, 0.0)
+            per_level = np.array([np.log2(m[c.attr][k] / np.maximum(others, u[c.attr][k]))
+                                  for k in range(2, c.n_levels)])
+            # the cap: min over the pair's level and every level above it
+            reachable = np.arange(2, c.n_levels)[:, None] >= lv[hit][None, :]
+            w[hit] = np.where(reachable, per_level, np.inf).min(axis=0)
         total += w
     assert total == pytest.approx(s.score.values)
+
+
+def test_64_a_near_miss_never_outscores_an_exact_hit_on_the_same_value(run: dict) -> None:
+    """The reordering that the per-pair cap exists to prevent."""
+    s, m, u, n = run["scored"], run["m"], run["u"], run["n"]
+    for c in mt.COMPARISONS:
+        if not c.tf or c.n_levels <= 3:
+            continue
+        top = c.n_levels - 1
+        count = s[f"tf_{c.attr}"].values * n
+        fuzzy = (s[c.attr].values >= 2) & (s[c.attr].values < top) & ~np.isnan(count)
+        if not fuzzy.any():
+            continue
+        others = np.maximum((count[fuzzy] - 1) / n, 0.0)
+        exact_on_same_value = np.log2(m[c.attr][top] / np.maximum(others, u[c.attr][top]))
+        assert (s[f"w_{c.attr}"].values[fuzzy] <= exact_on_same_value + 1e-9).all(), c.attr
 
 
 def test_5_a_missing_attribute_contributes_nothing(run: dict) -> None:

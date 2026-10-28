@@ -149,7 +149,7 @@ print(f"candidate pairs: {len(cand):,} ({len(cand) / NQ:.1f} per query)")
 print(f"blocking recall: {recall:.1%}")
 
 L = mt.compare(cand, q, e, tf)
-L.head()
+L.head(10)
 
 # %% [markdown]
 # Reading the table above: each attribute column holds a level code, where `0`
@@ -365,9 +365,15 @@ plt.show()
 #   distinct companies coincide on a name at about 2e-6 — twenty times rarer. So
 #   a genuinely unique name gets under-credited by about 3 bits.
 #
-# `mt.score` uses `u_v = max((count_v - 1) / N, u_exact)` instead. The floor is
+# `mt.score` uses `u_v = max((count_v - 1) / N, u_level)` instead. The floor is
 # the attribute-level `u` from step 4, which stops a value that happens to be
 # unique in our table from implying certainty.
+#
+# This applies at **every** agreement level, not just at exact. At a fuzzy
+# level the two strings differ, so the value being counted is the company's,
+# not the query's — the query's typo'd string is usually held by nobody, and
+# counting it would say "held by zero companies", which the formula reads as
+# rarer than unique. Step 7 shows why the fuzzy levels need this too.
 
 # %%
 lw = mt.level_weights(m, u)
@@ -417,6 +423,15 @@ wt[wt.level > 0].round(3)
 #    match. The cause is known: company-vs-company pairs contain no typos, so
 #    the fuzzy level's `u` was underestimated in step 4. `weight_used` caps each
 #    fuzzy level at the level above it.
+#
+#    The table is per attribute, but the cap has to be applied **per pair**,
+#    after step 6 has substituted the value-specific `u`. Otherwise the
+#    substitution reintroduces the inversion it was meant to fix: discounting
+#    only the exact level leaves a near miss on the registered-agent address
+#    worth 13.2 bits while an exact hit on that same address is worth 7.5. With
+#    the cap applied after, the near miss comes out at 3.3 bits, below the
+#    exact hit as it should be. `mt.score` does this; `weight_used` above is
+#    what it reduces to for a value only one company holds.
 #
 # 2. **Disagreement penalties should track how volatile the attribute is.**
 #    Phone (-1.9) and email (-2.5) are mild, because true matches disagree on
@@ -516,7 +531,7 @@ plt.show()
 # threshold from 63% to 72%, costing 0.2 points of precision (99.8% -> 99.6%).
 #
 # The query-level posterior is still clearly underconfident between 0.1 and 0.7
-# (predicted 0.18, observed 0.71; predicted 0.36, observed 0.84). Those queries
+# (predicted 0.18, observed 0.70; predicted 0.36, observed 0.84). Those queries
 # are mostly two kinds: "name matches exactly, address disagrees" (moves and
 # franchises) and "address only" (shared buildings). Leftover correlation
 # between attributes and the crude background factor account for the gap. If

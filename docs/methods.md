@@ -152,23 +152,35 @@ The two steps alternate until $`\lambda`$ and every $`m_{a}(\ell)`$ change by le
 
 ### 6.3 Value-specific non-match probability
 
-A single $`u`$ per attribute cannot separate agreement on a unique value from agreement on a value held by hundreds of entities. For agreement at the exact level on value $`v`$, the attribute-level $`u`$ is replaced by
+A single $`u`$ per attribute cannot separate agreement on a unique value from agreement on a value held by hundreds of entities. Let $`v`$ be the reference value the pair agreed on. At the exact level that is the value both sides hold. At a fuzzy level the two sides hold different strings, and $`v`$ is the entity’s: the query’s own string is typically held by no entity at all, so there is nothing to count on that side. If several reference values reach the pair’s level, the rarest is used.
+
+For any agreement level $`\ell \geq 2`$, the attribute-level $`u`$ is replaced by
 
 ``` math
-u_{v} = \max\left( \frac{c_{v} - 1}{N},\ u_{a}\left( \text{exact} \right) \right)
+u_{v}(\ell) = \max\left( \frac{c_{v} - 1}{N},\ u_{a}(\ell) \right)
 ```
 
-The usual term-frequency adjustment, $`c_{v}/N`$, counts the query’s own entity among the holders of the value. That puts a floor of $`1/N`$ on every agreement, which for names is far above the true rate at which distinct entities coincide. Using $`c_{v} - 1`$ counts only the other holders. The floor at $`u_{a}\left( \text{exact} \right)`$ stops a unique value from implying certainty. If several values agree, the rarest one is used.
+The usual term-frequency adjustment, $`c_{v}/N`$, counts the query’s own entity among the holders of the value. That puts a floor of $`1/N`$ on every agreement, which for names is far above the true rate at which distinct entities coincide. Using $`c_{v} - 1`$ counts only the other holders. The floor at $`u_{a}(\ell)`$ stops a unique value from implying certainty.
+
+At a fuzzy level this is an approximation. The quantity $`u_{a}(\ell)`$ is meant to be the rate at which a non-match *reaches level* $`\ell`$, so the value-specific version should count every entity holding any value that would reach $`\ell`$ against the query’s string, not only the holders of $`v`$. Counting $`c_{v}`$ alone understates it whenever the similarity neighbourhood spans several distinct values. It is still an improvement on the unadjusted $`u_{a}(\ell)`$, which the substitution can only increase, never decrease.
 
 The adjustment is only meaningful for attributes whose values are legitimately shared. The implementation switches it off per attribute (`tf=False` in `COMPARISONS`), and it is off for the tax identifier, whose values are unique in the reference table.
 
 ### 6.4 Monotone weights
 
-Agreement weights must not decrease as agreement strengthens. Because $`u`$ for the fuzzy levels is underestimated (Section 6.1), the raw estimates can give fuzzy agreement more weight than exact agreement. Each agreement level is capped at the weight of the levels above it:
+Agreement weights must not decrease as agreement strengthens. Because $`u`$ for the fuzzy levels is underestimated (Section 6.1), the raw estimates can give fuzzy agreement more weight than exact agreement. Each agreement level is therefore capped at the weight of the levels above it:
 
 ``` math
 {\widetilde{w}}_{a}(\ell) = \min_{k \geq \ell}w_{a}(k),\quad\quad\ell \geq 2
 ```
+
+The substitution of Section 6.3 can reorder the levels again, so the cap has to be applied after it, and therefore per pair rather than per attribute. Agreeing exactly on a value is at least as strong as agreeing approximately on it, so a pair at level $`\ell`$ on value $`v`$ is capped at what exact agreement on that same $`v`$ would earn:
+
+``` math
+\widetilde{w}(\ell,v) = \min_{k \geq \ell}\log_{2}\frac{m_{a}(k)}{u_{v}(k)},\quad\quad\ell \geq 2
+```
+
+This reduces to the attribute-level cap above when $`c_{v} = 1`$, and to the plain substitution when $`\ell`$ is the exact level. It matters in between. Without it, a near miss on an address held by 240 entities keeps the undiscounted fuzzy weight and outscores an exact hit on that same address, because only the exact level was discounted.
 
 ## 7. Probability of each candidate
 
@@ -275,7 +287,7 @@ The weights below come from full-scale estimates of the kind shown in Sections 9
 | Phone: disagree                 | 0.27  | 0.99998  | −1.89                    |
 | Phone: agree                    | 0.73  | 0.00002  | +15.16                   |
 
-The fuzzy address level shows the monotone cap of Section 6.4. Its raw weight is above the exact level’s, so it is capped there. The disagreement penalties also differ as Section 5 describes: a different name costs 5.6 bits, while a different phone costs only 1.9.
+The fuzzy address level shows the monotone cap of Section 6.4, here for a value held by a single entity. Its raw weight is above the exact level’s, so it is capped there. For a value held by more, both levels are discounted first and the cap is recomputed from the discounted weights. The disagreement penalties also differ as Section 5 describes: a different name costs 5.6 bits, while a different phone costs only 1.9.
 
 ### 9.4 Scoring one query
 
@@ -355,6 +367,7 @@ That leaves 0.211 for “none listed”. About 0.107 of that is the chance the c
 - **Deduplicated reference table.** The estimator in Section 6.1 is clean only if no two entities in the table are the same real-world entity. Undetected duplicates leak matches into $`u`$.
 - **Rare levels are bounded by sample size.** When distinct entities almost never agree on an attribute, $`u`$ is fixed by the smoothing floor, and the top weights grow by about one bit each time the sample is doubled. A candidate supported by one such attribute alone is likely to be overconfident.
 - **EM reports the data it is given.** If an attribute never changes in the data, EM learns a very large disagreement penalty for it, even if that attribute does change in practice. Estimated weights should be checked against domain knowledge.
+- **Value-specific $`u`$ at fuzzy levels.** The substitution of Section 6.3 counts the holders of the matched reference value, not the entities holding any value within the similarity band of the query’s string. Where that band covers several distinct values, the coincidence rate is understated and the fuzzy weight is too generous.
 - **Approximate background term.** $`B_{0}`$ assumes non-candidates disagree on every attribute they hold, independently across attributes, and it ignores near-miss names that fell outside blocking.
 - **At most one match per query.** Where the table legitimately holds several records for one real-world entity, the probability is split between them. The method does not enforce a one-to-one assignment across queries.
 - **Calibration.** Mid-range probabilities tend to be underconfident when the independence assumption is violated. A few hundred labelled pairs are enough to audit $`m`$, measure calibration, and fit a monotone (isotonic) mapping from $`P(e \mid q)`$ to an observed match rate. This is the cheapest correction.
