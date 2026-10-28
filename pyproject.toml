@@ -9,7 +9,7 @@ select = ["E", "F", "I", "UP"]
 "walkthrough.py" = ["E501"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.12"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

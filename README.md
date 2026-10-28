@@ -31,9 +31,19 @@ estimators, a worked numeric example and the assumptions it rests on.
 
 ## Setup
 
+Python 3.12. With pyenv:
+
+```sh
+pyenv virtualenv 3.12.11 entity-match
+pyenv local entity-match
+pip install -r requirements-dev.txt   # or requirements.txt to just run things
+```
+
+Or with plain venv:
+
 ```sh
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt       # or requirements-dev.txt to run the tests
+pip install -r requirements-dev.txt
 ```
 
 ## Generate the data
