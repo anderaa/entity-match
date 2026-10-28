@@ -4,6 +4,10 @@ line-length = 120
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP"]
 
+[tool.ruff.lint.per-file-ignores]
+# generated from walkthrough.ipynb; markdown table rows cannot be wrapped
+"walkthrough.py" = ["E501"]
+
 [tool.mypy]
 python_version = "3.11"
 ignore_missing_imports = true

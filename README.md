@@ -27,7 +27,7 @@ estimators, a worked numeric example and the assumptions it rests on.
 | `walkthrough.ipynb` | Step-by-step estimation without labels, graded against the ground truth at every step |
 | `walkthrough.py` | The same walkthrough as a plain script |
 | `docs/methods.md` | The method write-up |
-| `tests/` | Unit tests |
+| `tests/` | Unit tests, including the paper's worked example |
 
 ## Setup
 
@@ -100,7 +100,21 @@ decisions = mt.decide(posterior, accept_p=0.95, review_p=0.5)
 ## Development
 
 ```sh
+python generate_data.py --out data   # tests/test_pipeline_on_data.py skips without it
 pytest
 ruff check .
 mypy matching.py generate_data.py walkthrough.py
 ```
+
+`walkthrough.py` is generated from `walkthrough.ipynb`; edit the notebook.
+
+The tests check the implementation against `docs/methods.md` rather than just
+against itself:
+
+- `tests/test_methods_paper.py` runs the worked example from section 9 through
+  the code and asserts every number the paper quotes — the weight table, the
+  comparison levels, the four scores, the background factor, the posteriors,
+  and both decisions.
+- `tests/test_pipeline_on_data.py` recomputes the u estimator, the EM fixed
+  point, the background factor, rho and `P(e | q)` directly from the formulas
+  in sections 5 to 8 and compares them to what the pipeline produced.

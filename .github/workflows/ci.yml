@@ -17,4 +17,6 @@ jobs:
       - run: pip install -r requirements-dev.txt
       - run: ruff check .
       - run: mypy matching.py generate_data.py walkthrough.py
+      # the end-to-end tests need the dataset; it is reproducible from the default seed
+      - run: python generate_data.py --out data
       - run: pytest -q

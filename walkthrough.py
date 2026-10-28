@@ -1,20 +1,56 @@
 # %% [markdown]
-# # Entity matching: parameter estimation walkthrough
+# # Entity matching: estimating the parameters without labels
 #
-# This notebook estimates Fellegi-Sunter parameters **without labels**, then
-# uses the synthetic ground truth to check every estimate. The checks are the
-# point: each step has a common default that looks fine and is quietly wrong,
-# and the labels show by how much.
+# We have a table of 50,000 known companies and 20,000 incoming records
+# ("queries"). For each query we want to know which company it refers to, or
+# that it refers to none of them. The method is written up in
+# [`docs/methods.md`](docs/methods.md); this notebook runs it end to end and
+# checks every step against the answer key.
 #
-# | Step | Estimates | Without labels via | Default that fails |
+# ## The idea in one paragraph
+#
+# Compare a query to a candidate company one attribute at a time. For each
+# attribute, ask two questions: **how often do true matches look like this?**
+# (call it `m`) and **how often do non-matches look like this by coincidence?**
+# (call it `u`). The ratio `m / u` says how much that piece of evidence is
+# worth. Take the log, add the pieces up, and you have a score. Agreeing on a
+# rare phone number is strong evidence because `m` is high and `u` is tiny.
+# Agreeing on a shared office address is weak evidence because `u` is also
+# high. This is the Fellegi-Sunter model.
+#
+# ## The vocabulary
+#
+# | Term | What it means |
+# |---|---|
+# | **attribute** | name, address, phone, email, website or tax id |
+# | **comparison level** | how a query and a company compare on one attribute: `0` = one side is missing it, `1` = they disagree, `2+` = increasing agreement, top level = identical |
+# | **m** | P(this level \| the pair really is a match). High for reliable attributes |
+# | **u** | P(this level \| the pair is not a match). The coincidence rate |
+# | **weight** | `log2(m / u)` for the observed level, in bits. Positive = evidence for, negative = evidence against |
+# | **bit** | a factor of 2. +10 bits means the evidence is ~1,000x more likely under a match; +20 bits, ~1,000,000x |
+# | **score** | the weights added up across attributes. A missing attribute contributes 0 |
+# | **candidate** | a company worth scoring against this query, found by blocking |
+# | **blocking** | the cheap filter that avoids scoring all 50,000 x 20,000 pairs |
+# | **N** | number of known companies (50,000) |
+# | **rho** | share of queries whose company is actually in the table |
+#
+# ## Why this notebook exists
+#
+# `m` and `u` are the whole model, and in real work nobody hands them to you.
+# Estimating them from unlabeled data is where the method is won or lost. Each
+# step below has an obvious default that looks reasonable and is quietly wrong.
+# Because this dataset is synthetic we have the true answers, so we can run the
+# unlabeled estimator, run the obvious default, and show both against the truth.
+#
+# | Step | What we estimate | How, without labels | The default that fails |
 # |---|---|---|---|
-# | 4 | u: P(level \| non-match) | entity-vs-entity pairs | random query-vs-entity pairs |
-# | 5 | m: P(level \| match) | EM per blocking round, u fixed | one EM over all candidates |
-# | 6 | value-specific u | (count − 1) / N with floor | count / N |
-# | 8 | match probability | query-level posterior | pairwise posterior, prior 1/N |
+# | 4 | `u`: P(level \| non-match) | compare known-distinct companies to each other | random query-company pairs |
+# | 5 | `m`: P(level \| match) | one EM run per blocking rule, `u` held fixed | one EM run over all candidates |
+# | 6 | value-specific `u` | `(count - 1) / N`, with a floor | `count / N` |
+# | 8 | match probability | normalize over all companies, per query | score each pair on its own |
 #
-# Data: `generate_data.py` (50,000 entities, 20,000 queries, 15% of queries
-# unknown). Code: `matching.py`.
+# The data comes from `generate_data.py` (50,000 companies, 20,000 queries, 15%
+# of which refer to no company in the table). The library is `matching.py`.
 
 # %%
 import matplotlib.pyplot as plt
@@ -37,9 +73,18 @@ print(f"queries with a true match in the table: {T.entity_id.notna().mean():.1%}
 # %% [markdown]
 # ## 1. What the data looks like
 #
-# Attributes per entity range from 1 to 10. Coverage is uneven: every entity
-# has a name, but only ~40% have a tax id. That unevenness is why the null
-# level must contribute 0 rather than count as disagreement.
+# Both tables are in long format: one row per `(id, attribute, value)`, so a
+# company with four attributes takes four rows. Companies have between 1 and 10
+# attributes.
+#
+# Two things to read off the table below:
+#
+# - **Coverage is uneven.** Every company has a name, but only ~40% have a tax
+#   id. This is why a missing attribute has to count as *nothing* rather than as
+#   disagreement — otherwise every company without a tax id would be penalized
+#   for a gap in our records.
+# - **Values are shared.** `max_entities_per_value` is the worst case per
+#   attribute.
 
 # %%
 per = E.groupby("entity_id").size()
@@ -51,16 +96,25 @@ shared = (E.groupby(["attr_type", "value"]).entity_id.nunique()
 pd.concat([cov, qcov, shared], axis=1).round(3)
 
 # %% [markdown]
-# The `max_entities_per_value` column shows the shared-value problem: one
-# address is used by ~240 entities (a registered-agent office) and one phone
-# by ~100 (an answering service). Agreeing on those is close to worthless,
-# and a single weight per attribute can't express that.
+# One address is used by ~240 companies (a registered-agent office) and one
+# phone by ~100 (an answering service). Agreeing on *those* values is nearly
+# worthless, while agreeing on a one-off address is strong evidence. A single
+# `u` per attribute cannot say both things at once, which is the problem step 6
+# solves.
 #
 # ## 2. Normalize
 #
-# Every downstream number depends on this step. Suite numbers are stripped
-# from addresses, so all tenants of a building share one normalized address.
-# This is intentional, and it is why step 6 is needed.
+# Before anything is compared, values are put in a standard form: names are
+# lower-cased with punctuation and legal suffixes (Inc, LLC, Corp) removed,
+# phones are reduced to ten digits, websites lose `https://` and `www.`, and
+# addresses lose their suite numbers and get standard street abbreviations.
+#
+# Dropping suite numbers is a deliberate choice, not an oversight. It means
+# every tenant of a building ends up with the same normalized address, which is
+# what lets us find them — and it is exactly why step 6 is needed to stop that
+# agreement from counting for too much.
+#
+# Everything downstream depends on this step, so it is worth eyeballing.
 
 # %%
 e = mt.normalize(E, "entity_id")
@@ -71,9 +125,21 @@ Q.head(6).assign(norm=q.head(6).norm.values)
 # %% [markdown]
 # ## 3. Blocking and comparison vectors
 #
-# Candidates are pairs that share an exact normalized value on any
-# attribute, or a rare name token (held by ≤ 30 entities). Blocking recall is
-# a hard ceiling: a true match that never becomes a candidate can't be found.
+# Scoring all 20,000 x 50,000 = 1 billion pairs would be wasteful, and nearly
+# all of them are obvious non-matches. **Blocking** picks the pairs worth
+# scoring. A company becomes a candidate for a query if they share either:
+#
+# 1. an exact normalized value on any attribute, or
+# 2. a rare name token — one held by 30 companies or fewer. This catches
+#    "Acme Widgets Inc" vs "Acme Widgets LLC" and single typos, as long as one
+#    unusual word survives intact.
+#
+# Blocking recall is a hard ceiling on everything that follows. A true match
+# that never becomes a candidate cannot be recovered by any amount of clever
+# scoring later, so it is the first number to check.
+#
+# `mt.compare` then turns each candidate pair into a **comparison vector**: one
+# level per attribute, describing how the two sides line up.
 
 # %%
 cand = pd.concat([mt.block_exact(q, e, ATTRS), mt.block_name_tokens(q, e)]).drop_duplicates()
@@ -86,12 +152,26 @@ L = mt.compare(cand, q, e, tf)
 L.head()
 
 # %% [markdown]
-# Level codes: 0 = null, 1 = disagree, higher = stronger agreement. See
-# `mt.COMPARISONS` for the labels. The `tf_<attr>` columns hold the
-# frequency of the agreeing value and are used in step 6.
+# Reading the table above: each attribute column holds a level code, where `0`
+# means one side is missing the attribute, `1` means the two sides disagree, and
+# higher numbers mean stronger agreement up to exact equality. Name has 5 levels
+# (the middle two are Jaro-Winkler similarity bands), address has 4, and the
+# rest have 3. `mt.COMPARISONS` holds the labels. The `tf_<attr>` columns record
+# how common the agreeing value is; step 6 uses them.
 #
-# Labeled reference values come next. In practice you won't have these.
-# They exist here only to grade the unlabeled estimates.
+# ### The answer key
+#
+# The next cell builds the reference values we will grade against. **You will
+# not have these on real data** — they exist here only so each unlabeled
+# estimate can be checked:
+#
+# - `m_true`: `m` computed from the true matching pairs.
+# - `u_true`: `u` computed from random query-company pairs with the true matches
+#   removed.
+#
+# It also builds `RQ`, a million random query-company pairs *without* removing
+# the true matches. That is the naive way to estimate `u`, and step 4 shows what
+# it costs.
 
 # %%
 TL = mt.compare(truth[["qid", "eid"]], q, e, tf)
@@ -108,16 +188,23 @@ print(f"true matches inside 1M 'random' query-entity pairs: {is_match.sum()}")
 # %% [markdown]
 # ## 4. Estimate u
 #
-# u is the easy parameter, since almost every random pair is a non-match.
-# "Almost" is the catch. The match rate in random pairs is ≈ ρ/N ≈ 1.7e-5,
-# and u for a discriminating level like *exact name* is the same order of
-# magnitude. The few true matches in a random sample therefore inflate u
-# exactly where it matters.
+# `u` is the coincidence rate: how often a pair that is *not* a match still
+# agrees on an attribute. It looks like the easy parameter, because almost any
+# random pair of records is a non-match. "Almost" is the catch.
 #
-# The fix: if the known-entity table is deduplicated, **pairs of distinct
-# entities are non-matches by construction**. The tradeoff is that entity
-# values are cleaner than query values, so u for fuzzy levels comes out too
-# low. Step 7 deals with that.
+# The share of random query-company pairs that are secretly true matches is
+# about rho/N, which is roughly 1.7e-5 here. For a discriminating level such as
+# *exact name*, the true coincidence rate is about 2e-6 — **smaller than the
+# contamination rate**. A handful of real matches hiding in the sample then
+# dominates the estimate and inflates `u` exactly where accurate values matter
+# most.
+#
+# The fix: if the company table has been deduplicated, then any two *distinct*
+# companies are a non-match by construction. No contamination, no labels needed.
+#
+# The trade-off is that company records are cleaner than query records — no
+# typos — so this understates `u` for the fuzzy "nearly agrees" levels. Step 7
+# deals with that.
 
 # %%
 a_, b_ = rng.choice(e.id.unique(), 2_000_000), rng.choice(e.id.unique(), 2_000_000)
@@ -134,27 +221,47 @@ pd.DataFrame(rows).set_index("attr").style.format(
     "{:.2e}", subset=["u_labeled", "u_random_query_pairs", "u_entity_pairs"])
 
 # %% [markdown]
-# Random query pairs overstate u for name (10×), email (6×) and tax id (4×).
-# The 21 true matches in the sample are the excess. Entity pairs avoid this.
-# Address is fine either way, because its u is driven by genuinely shared
-# buildings. For phone, entity pairs *over*state u (entities carry more phones
-# than a query does), which errs conservative.
+# Compare the last two columns against `u_labeled`. Random query pairs overstate
+# `u` by about 10x for name, 6x for email and 4x for tax id — and those are
+# precisely the attributes whose high weights carry the match. The excess is the
+# 21 true matches sitting in the sample. Company-vs-company pairs avoid it.
 #
-# There is a second limitation that labels don't fix. For name, email,
-# website and tax id, distinct entities almost never agree, so every column
-# here is at or near the pseudo-count floor, 1 / (number of non-null pairs).
-# Those u values, and therefore the top weights, are set by **sample size**:
-# twice as many pairs would add about one bit. The query-level posterior in
-# step 8 limits how much this matters, but it is a real source of
-# overconfidence when one of these attributes is the only evidence.
+# Address is fine either way, because its `u` is driven by genuinely shared
+# buildings rather than by contamination. For phone, company pairs *overstate*
+# `u` (a company record carries more phone numbers than a query does), which
+# errs in the safe direction.
 #
+# **A limit that labels do not fix.** For name, email, website and tax id,
+# distinct companies essentially never agree, so the counts behind these numbers
+# are 0 to 4 agreements out of two million pairs. The estimate is then pinned near the
+# pseudo-count floor of `1 / (number of non-null pairs)`, which means it is
+# reporting our sample size rather than measuring anything. Doubling the sample
+# would add about one bit to the top weight. The query-level posterior in step 8
+# limits the damage, but a candidate supported by one of these attributes alone
+# should be treated as less certain than its score suggests.
+
+# %% [markdown]
 # ## 5. Estimate m with EM
 #
-# m needs matches, and matches are only common among candidate pairs. Those
-# pairs were selected for agreeing on something, which breaks the obvious
-# approach.
+# `m` is the opposite problem. It is the rate at which *true matches* show each
+# level, so estimating it needs a pool of pairs with plenty of real matches in
+# it — and the only such pool is the candidate set.
 #
-# ### 5a. The naive approach: one EM over all candidates
+# Since we have no labels, we use **expectation-maximization**. EM handles
+# exactly this situation: we believe the candidate pairs are a mixture of
+# matches and non-matches, but we cannot see which is which. So we guess the
+# mixture, use the guess to assign each pair a probability of being a match,
+# re-estimate the mixture from those probabilities, and repeat until it settles:
+#
+# 1. **E-step** — given current `m`, `u` and lambda (the share of matches), work
+#    out each pair's probability of being a match.
+# 2. **M-step** — recompute `m` and lambda, counting each pair in proportion to
+#    that probability.
+#
+# Throughout, `u` is held fixed at the step-4 values. We already have a clean
+# estimate of it and we do not want EM to drift it around.
+#
+# ### 5a. The obvious approach, and why it breaks
 
 # %%
 naive = mt.em(L, u, ATTRS)
@@ -162,19 +269,30 @@ print(f"naive EM: lambda = {naive.lam:.3f}, iterations = {naive.n_iter}")
 pd.DataFrame({a: {"m_agree_naive": naive.m[a][-1], "m_agree_true": m_true[a][-1]} for a in ATTRS}).T.round(3)
 
 # %% [markdown]
-# This is badly wrong. Every candidate agrees on its blocking value, and u
-# (from random pairs) says such agreement is rare among non-matches. So EM
-# labels nearly all candidates as matches. The non-matches pulled in through
-# a shared building address then become "matches" that disagree on
-# everything else, and m for agreement collapses.
+# Those `m_agree` values are badly wrong, and the reason is worth understanding
+# because it is easy to walk into.
 #
-# ### 5b. The fix: one EM round per blocking rule, excluding the blocked attribute
+# Every candidate pair is a candidate *because* it agrees on some blocking
+# value. Meanwhile `u` says such agreement is vanishingly rare among
+# non-matches. Put those together and EM concludes that almost every candidate
+# is a match — lambda shoots up. The non-matches dragged in by a shared office
+# address are now labelled "matches", and they disagree on everything else, so
+# `m` for agreement on the other attributes collapses toward 0.
 #
-# Within the pairs blocked on exact name, name carries no information (every
-# pair agrees), so it is left out and the others are estimated. Then the same
-# is done for pairs blocked on phone. Each attribute is estimated in at least
-# one round where it was not used for selection. u is held fixed throughout.
-# This is the approach Splink uses.
+# The model is being told "these pairs were selected for agreeing" and has no
+# way to know it.
+#
+# ### 5b. The fix: one EM run per blocking rule, leaving that rule's attribute out
+#
+# Inside the set of pairs blocked on exact name, every pair agrees on name, so
+# name carries no information about which of them are matches. Drop it from the
+# likelihood and estimate the others. Then do the same for pairs blocked on
+# phone, dropping phone.
+#
+# The requirement is that each attribute gets estimated in at least one round
+# where it was *not* the thing used for selection. Blocking on name and on phone
+# is enough to cover all six attributes here. Attributes estimated in both
+# rounds take the average. (This is how Splink does it.)
 
 # %%
 pairs_name = L.merge(mt.block_exact(q, e, ["name"]), on=["qid", "eid"])
@@ -212,30 +330,44 @@ ax.spines[["top", "right"]].set_visible(False)
 plt.show()
 
 # %% [markdown]
-# Per-round EM recovers m to within about ±0.01 for most levels. The
-# exception is informative. In the phone-blocked round, **address**
-# agreement is inflated (≈0.93 vs 0.85 true). Pairs blocked on a matching
-# phone are disproportionately entities that haven't moved, and moving
-# changes address and phone together. This is the conditional-independence
-# violation from the earlier summary showing up in the estimates themselves.
-# Averaging across rounds dilutes it, but nothing here removes it.
+# Per-round EM lands within about +-0.01 of the truth for most levels, against a
+# naive estimate that is wrong by a factor of 2 to 10 on every agreement
+# level. Two things in the output
+# deserve attention.
 #
-# Also note that m for `website: disagree` is ≈0.001. In this synthetic data
-# websites essentially never change. Real websites do, and the −10-bit
-# penalty this produces would be wrong. Read EM output with domain knowledge.
+# **The address estimate in the phone-blocked round is inflated** (~0.93 against
+# a true 0.85). Pairs selected for having a matching phone are disproportionately
+# companies that have not moved, and moving changes address and phone *together*.
+# So the pairs in that round are not a fair sample for address. This is the
+# conditional-independence assumption failing, visible directly in the
+# parameters. Averaging across rounds dilutes it; nothing here removes it.
+#
+# **`website: disagree` comes out at ~0.001**, which produces a roughly -10 bit
+# penalty for a mismatched website. That is a fact about this synthetic data,
+# where websites essentially never change. Real websites do change, and that
+# penalty would be badly wrong. EM reports what is in the data it is given;
+# weights still need a sanity check against what you know about the domain.
 #
 # ## 6. Value-specific u (term frequency)
 #
-# The textbook term-frequency adjustment sets u_v = count_v / N. It has two
+# Step 4 gave one `u` per attribute. But agreeing on a unique address and
+# agreeing on the registered-agent address shared by 240 companies are not the
+# same evidence, and one number cannot represent both.
+#
+# The standard fix is a term-frequency adjustment: replace `u` with
+# `count_v / N`, the share of companies holding that exact value. It has two
 # problems:
 #
-# - It counts the query's own entity among the holders. For a value held by
-#   2 entities, one of which is the match, only **1** other holder is a
-#   coincidence.
-# - It puts a floor of 1/N on every agreement. For names, distinct entities
-#   coincide at about 1e-6, which is 20× less than 1/N here.
+# - **It counts the query's own company.** If a value is held by 2 companies and
+#   one of them is the true match, only **1** of them is a coincidence. The
+#   count should be `count_v - 1`.
+# - **It puts a floor of `1/N` under every agreement.** Here `1/N` is 2e-5, but
+#   distinct companies coincide on a name at about 2e-6 — twenty times rarer. So
+#   a genuinely unique name gets under-credited by about 3 bits.
 #
-# `mt.score` uses u_v = max((count_v − 1)/N, u_exact) instead. The hub cases:
+# `mt.score` uses `u_v = max((count_v - 1) / N, u_exact)` instead. The floor is
+# the attribute-level `u` from step 4, which stops a value that happens to be
+# unique in our table from implying certainty.
 
 # %%
 lw = mt.level_weights(m, u)
@@ -253,17 +385,23 @@ for attr in ["address", "phone", "name"]:
 pd.DataFrame(examples).round(2)
 
 # %% [markdown]
-# Agreeing on the registered-agent address is worth ~7.5 bits instead of
-# ~13. Agreeing on a unique name keeps its full ~18.5 bits instead of the
-# ~15.5 the textbook formula gives. A name shared by two entities drops to
-# ~15.5, and the query-level posterior then splits the probability between
-# them.
+# Read the `address` rows first. Agreeing on the registered-agent address is
+# worth ~7.5 bits instead of the ~13 a single attribute-level weight would give
+# — about 50 times less evidence, which is the right answer. Then the `name`
+# rows: a unique name keeps its full ~18.5 bits, where the textbook formula
+# would charge it down to ~15.5. A name shared by exactly two companies drops to
+# ~15.5, and the query-level posterior in step 8 then splits the probability
+# between the two of them, which is also the right answer.
 #
-# The `(count − 1)` correction assumes the query's entity is one of the
-# holders. That is optimistic for unknown queries, and the `u_exact` floor is
-# what keeps it from becoming overconfident.
+# Note what the `count - 1` correction assumes: that the query's company is one
+# of the holders. For a query whose company is *not* in the table that is
+# optimistic, and the `u_exact` floor is the only thing keeping it in check.
 #
 # ## 7. Weights
+#
+# With `m` and `u` in hand, every level gets a weight of `log2(m / u)` in bits,
+# and a pair's score is the sum over the attributes present. `weight` below is
+# the raw ratio; `weight_used` is what `mt.score` actually applies.
 
 # %%
 wt = mt.weight_table(m, u)
@@ -273,26 +411,44 @@ wt[wt.level > 0].round(3)
 # %% [markdown]
 # Two things to check in any weight table:
 #
-# 1. **Monotonicity.** `address lev>=0.90` has a raw weight above `exact`.
-#    Entity-vs-entity pairs contain no typos, so the fuzzy-level u is
-#    underestimated. `weight_used` caps each fuzzy level at the level above
-#    it.
-# 2. **Disagreement penalties track volatility.** Phone (−1.9) and email
-#    (−2.5) are mild. Tax id (−5.5) and name (−5.7) are stiff. These come out
-#    of the data, not hand-tuning, which is the main reason to estimate rather
-#    than set them.
+# 1. **Agreement weights must not go down as agreement gets stronger.** Here the
+#    raw weight for `address lev>=0.90` comes out *above* the one for `exact`,
+#    which is nonsense — a near-match cannot be better evidence than an exact
+#    match. The cause is known: company-vs-company pairs contain no typos, so
+#    the fuzzy level's `u` was underestimated in step 4. `weight_used` caps each
+#    fuzzy level at the level above it.
+#
+# 2. **Disagreement penalties should track how volatile the attribute is.**
+#    Phone (-1.9) and email (-2.5) are mild, because true matches disagree on
+#    them fairly often — people change numbers. Tax id (-5.5) and name (-5.7)
+#    are stiff, because true matches rarely disagree on those. Nobody tuned
+#    these; they fall out of `m`, and getting them for free is much of the
+#    reason to estimate parameters rather than hand-pick them.
 #
 # ## 8. From score to probability
 #
-# A pairwise posterior uses prior odds of about ρ/N, roughly −16 bits here.
-# It treats the other N−1 entities as uninformative, when in fact they mostly
-# *disagree* with the query. That makes it underconfident, and two tied
-# candidates can both look certain.
+# A score is a log Bayes factor; turning it into a probability needs a prior.
+# The obvious way is to treat each pair on its own: prior odds of about rho/N
+# (roughly -16 bits here), run it through the score, read off a probability.
 #
-# `mt.query_posterior` instead normalizes over all N entities. Candidates
-# contribute their Bayes factor, and non-candidates contribute an
-# approximate background factor. It also estimates ρ (the share of queries
-# with a match) by EM.
+# That throws away two facts:
+#
+# - **The other companies mostly disagree with this query**, and that is
+#   evidence too. Ignoring it makes the pairwise number *underconfident*.
+# - **A query refers to at most one company.** Ignoring that makes the pairwise
+#   number *overconfident* when two candidates both score well: they can each
+#   come back at 0.99, which cannot both be true.
+#
+# `mt.query_posterior` normalizes across all N companies instead. The candidates
+# contribute their actual Bayes factors; the ~50,000 companies that blocking
+# never looked at contribute an approximate background factor each, built from
+# how often a company holds each attribute and what disagreement costs. Because
+# every candidate for a query shares one denominator, their probabilities sum to
+# at most 1, and the remainder is the probability that the right answer is not
+# in the list at all. A genuine two-way tie now shows up as 0.49 and 0.49.
+#
+# It also estimates rho, the share of queries whose company is in the table, by
+# fixed-point iteration — no labels needed.
 
 # %%
 S = mt.score(L, m, u, n_entities=N)
@@ -313,7 +469,8 @@ def top_per_query(df: pd.DataFrame, col: str) -> pd.DataFrame:
     :param col: probability column
     :return: one row per query (including queries with no candidates)
     """
-    t = df.sort_values(col, ascending=False).drop_duplicates("qid")[["qid", "eid", col]]
+    # eid breaks exact ties so the pick is reproducible; sort_values is not stable
+    t = df.sort_values([col, "eid"], ascending=[False, True]).drop_duplicates("qid")[["qid", "eid", col]]
     out = T.rename(columns={"query_id": "qid", "entity_id": "true_eid"}).merge(t, on="qid", how="left")
     out[col] = out[col].fillna(0.0)
     out["correct"] = out.eid == out.true_eid
@@ -342,23 +499,40 @@ ax.spines[["top", "right"]].set_visible(False)
 plt.show()
 
 # %% [markdown]
-# Both are underconfident in the middle, and neither is calibrated there.
-# The difference is in where queries land. The pairwise version leaves
-# ~3,400 queries in the 0.1–0.9 band. The query-level version leaves ~2,200,
-# and moves the rest into ≥ 0.95, where they are 97.6% correct. That shift
-# raises the auto-accept rate at 0.95 from 63% to 72%, for a 0.2-point drop
-# in precision (99.8% → 99.6%).
+# The estimate of rho comes out below the truth (0.80 against 0.85) by roughly
+# the share of true matches blocking never found. The model cannot see matches
+# it was never shown, so this is expected rather than a bug.
 #
-# The query-level version is still **underconfident in 0.1–0.7** (predicted
-# 0.18 → observed 0.72; 0.36 → 0.85).
-# Those queries are mostly "exact name, address disagrees" (moves and
-# franchises) and "address only" (shared buildings). Residual correlation
-# between attributes, plus the crude background factor, account for the gap.
-# If the band matters to you, a small labeled sample plus isotonic regression
-# on `p` fixes it more cheaply than refining the model.
-
-# %% [markdown]
+# Now compare the two columns in the calibration table, and the two lines in the
+# plot. `predicted` is the average probability the model assigned in that band;
+# `observed` is how often it was actually right. On a perfectly calibrated model
+# they would be equal.
+#
+# Neither version is calibrated in the middle — both are underconfident there.
+# What differs is **where the queries end up**. The pairwise version strands
+# ~3,400 queries in the uncertain 0.1-0.9 band; the query-level version leaves
+# ~2,200 and pushes the rest up into >= 0.95, where 97.6% of the 0.95-0.99 band
+# turns out correct. In practice that raises the auto-accept rate at a 0.95
+# threshold from 63% to 72%, costing 0.2 points of precision (99.8% -> 99.6%).
+#
+# The query-level posterior is still clearly underconfident between 0.1 and 0.7
+# (predicted 0.18, observed 0.71; predicted 0.36, observed 0.84). Those queries
+# are mostly two kinds: "name matches exactly, address disagrees" (moves and
+# franchises) and "address only" (shared buildings). Leftover correlation
+# between attributes and the crude background factor account for the gap. If
+# that band matters to you, a few hundred labels plus isotonic regression on `p`
+# will fix it far more cheaply than improving the model.
+#
 # ## 9. Decisions
+#
+# The ranked list with probabilities is the real output. When a single answer is
+# needed, take the top candidate and apply two thresholds: accept at >= 0.95,
+# send to review at >= 0.5, otherwise call it no match. Queries with no
+# candidates at all are no matches by definition.
+#
+# No "is the top candidate far enough ahead of the second?" rule is needed,
+# because the query-level posterior already splits probability between close
+# candidates — a tie cannot produce a high top probability.
 
 # %%
 D = mt.decide(P, accept_p=0.95, review_p=0.5)
@@ -374,8 +548,8 @@ print(f"\nauto-accept rate {len(acc) / len(D):.1%}, precision {(acc.eid == acc.t
 print(f"review rate {(D.decision == 'review').mean():.1%}")
 
 # %% [markdown]
-# Threshold sweep, to choose the auto-accept cutoff from a precision target
-# rather than by feel:
+# Both thresholds are policy, not statistics. The sweep below is how to pick the
+# accept cutoff from a precision target instead of by feel.
 
 # %%
 d = top_per_query(P, "p")
@@ -385,6 +559,9 @@ pd.DataFrame(sweep).round(4)
 
 # %% [markdown]
 # ### Where it fails
+#
+# The flags in `truth.csv` record what the generator did to each query, so we
+# can break the results down by failure mode rather than looking at one average.
 
 # %%
 seg = D.assign(segment=np.select([D.true_eid.isna(), D.moved, D.rebranded, D.contaminated],
@@ -396,34 +573,37 @@ seg.groupby("segment").agg(n=("qid", "size"),
                            accepted_wrong=("accepted_wrong", "mean")).round(3)
 
 # %% [markdown]
-# - **Rebranded:** the name changed and the old one is in the table. Without
-#   a second attribute these are unrecoverable, and they should end up as
-#   `no_match`, not as a wrong accept.
-# - **Moved:** address and phone disagree together. These lean on name, and
-#   they are much of the review queue.
-# - **Unknown entities:** 1.6% are auto-accepted, which is 48 of the 62
-#   wrong accepts overall. These are same-name or same-building hard
-#   negatives. The dominant error is failing to say "not in the table," not
-#   choosing the wrong candidate. If false accepts are costly, spend labeling
-#   effort there.
+# - **Rebranded** (the name changed and the old one is still in the table):
+#   without a second attribute to go on these are unrecoverable. What matters is
+#   that they come out as `no_match` rather than as a confident wrong answer.
+# - **Moved**: address and phone disagree together, so these lean entirely on
+#   the name, and they make up much of the review queue.
+# - **Unknown companies** (not in the table at all): 1.6% are auto-accepted, and
+#   those 48 queries are most of the 62 wrong accepts in the whole run. They are
+#   same-name or same-building hard negatives. The dominant failure of this
+#   system is not picking the wrong company — it is failing to say "not in the
+#   table". If false accepts are expensive, that is where labeling effort pays.
 #
-# ## Takeaways
+# ## What to take away
 #
-# 1. **Estimate u from pairs you know are non-matches** (distinct entities
-#    in a deduplicated table), not from random query pairs.
-# 2. **Never run EM on a blocked candidate set with the blocking attribute
-#    in the model.** Run one round per blocking rule and leave that rule's
-#    attributes out.
-# 3. **Term frequency needs the count − 1 correction and a floor**, or
-#    unique values get under-weighted and shared ones over-weighted.
-# 4. **Normalize probabilities per query.** A pairwise posterior is
-#    underconfident and can't represent a tie between candidates.
-# 5. **Check the model against even a few hundred labels.** Every
-#    failure above is invisible without them, and the independence
-#    assumption (move → address and phone change together) shows up in
-#    both m and calibration.
+# 1. **Estimate `u` from pairs you know are non-matches** — distinct companies
+#    in a deduplicated table — not from random query pairs. The contamination in
+#    random pairs is the same size as the quantity being measured.
+# 2. **Never run EM over a blocked candidate set with the blocking attribute in
+#    the model.** Run one round per blocking rule and leave that rule's
+#    attribute out.
+# 3. **Term frequency needs the `count - 1` correction and a floor.** Without
+#    them, unique values are under-weighted and shared ones over-weighted.
+# 4. **Normalize probabilities per query.** Scoring each pair in isolation
+#    cannot represent "it is one of these two", and reports both at 0.99.
+# 5. **Check the model against even a few hundred labels.** Every failure above
+#    is invisible without them, and the independence assumption — a move changes
+#    address and phone together — shows up in both `m` and the calibration.
 #
-# **Applying this to your data:** `normalize` expects `(id, attr_type,
-# value)`. Edit `NORMALIZERS` and `COMPARISONS` for your attribute types,
-# and pick blocking rules for the EM rounds that each leave out a different
-# attribute.
+# ## Applying this to your own data
+#
+# `mt.normalize` expects long format: `(id, attr_type, value)`. Edit
+# `NORMALIZERS` for how your attribute types should be cleaned and `COMPARISONS`
+# for their levels and thresholds. Then pick blocking rules for the EM rounds so
+# that every attribute is estimated in at least one round where it was not the
+# blocking key.

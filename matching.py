@@ -513,7 +513,8 @@ def decide(posterior: pd.DataFrame, accept_p: float = 0.95, review_p: float = 0.
     :return: one row per query with a candidate: ``qid``, ``eid``, ``score``, ``p``,
         ``p_second``, ``decision``
     """
-    s = posterior.sort_values(["qid", "p"], ascending=[True, False])
+    # eid breaks exact ties so the pick is reproducible; sort_values is not stable
+    s = posterior.sort_values(["qid", "p", "eid"], ascending=[True, False, True])
     s["rank"] = s.groupby("qid").cumcount()
     top = s[s["rank"] == 0].set_index("qid")
     top["p_second"] = s[s["rank"] == 1].set_index("qid").p.reindex(top.index).fillna(0.0)

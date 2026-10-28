@@ -42,7 +42,7 @@ The method is a Fellegi–Sunter likelihood-ratio model. Its parameters are esti
 Values are normalized per attribute type before comparison:
 
 - **Names:** lower-cased, “&” mapped to “and”, punctuation removed, legal suffixes (Inc, LLC, Co, Corp, Ltd, and their variants) dropped.
-- **Addresses:** suite and unit designators removed, street types reduced to a standard abbreviation, punctuation removed.
+- **Addresses:** suite, unit and apartment designators removed, street types reduced to a standard abbreviation, punctuation removed.
 - **Phone numbers:** reduced to their final ten digits.
 - **Websites:** scheme and “www.” removed.
 - **Identifiers:** reduced to digits.
@@ -134,7 +134,7 @@ EM is therefore run separately on the pairs produced by each single-key blocking
 
 - $`u`$ is held fixed at the values from Section 6.1.
 - The blocked attribute is left out of the likelihood. Within that block it agrees for every pair, so it carries no information.
-- The rules are chosen so that every attribute is left out of at least one round. Blocking on exact name in one round and exact phone in another is sufficient.
+- The rules are chosen so that every attribute is estimated in at least one round, that is, no attribute is the blocking key in every round. Blocking on exact name in one round and exact phone in another is sufficient.
 
 Let $`\mathcal{A}`$ be the attributes in a round and $`\gamma_{ia}`$ the level of pair $`i`$. The E-step computes each pair’s match probability:
 
@@ -160,6 +160,8 @@ u_{v} = \max\left( \frac{c_{v} - 1}{N},\ u_{a}\left( \text{exact} \right) \right
 
 The usual term-frequency adjustment, $`c_{v}/N`$, counts the query’s own entity among the holders of the value. That puts a floor of $`1/N`$ on every agreement, which for names is far above the true rate at which distinct entities coincide. Using $`c_{v} - 1`$ counts only the other holders. The floor at $`u_{a}\left( \text{exact} \right)`$ stops a unique value from implying certainty. If several values agree, the rarest one is used.
 
+The adjustment is only meaningful for attributes whose values are legitimately shared. The implementation switches it off per attribute (`tf=False` in `COMPARISONS`), and it is off for the tax identifier, whose values are unique in the reference table.
+
 ### 6.4 Monotone weights
 
 Agreement weights must not decrease as agreement strengthens. Because $`u`$ for the fuzzy levels is underestimated (Section 6.1), the raw estimates can give fuzzy agreement more weight than exact agreement. Each agreement level is capped at the weight of the levels above it:
@@ -170,7 +172,7 @@ Agreement weights must not decrease as agreement strengthens. Because $`u`$ for 
 
 ## 7. Probability of each candidate
 
-A pairwise posterior judges each pair in isolation, with prior odds of about $`\rho/N`$. It ignores two things. The other entities mostly disagree with the query, which is itself evidence. And a query refers to at most one entity. Because of this, the pairwise posterior is underconfident, and two tied candidates can both receive high probabilities.
+A pairwise posterior judges each pair in isolation, with prior odds of about $`\rho/N`$. It ignores two things. The other entities mostly disagree with the query, which is itself evidence. And a query refers to at most one entity. The two omissions pull in opposite directions. Ignoring the disagreement of the other entities makes the pairwise posterior underconfident. Ignoring the one-match constraint makes it overconfident whenever two candidates both score well, so two tied candidates can each receive a probability near 1 (Section 9.4).
 
 The method instead normalizes over the whole reference table. Let $`BF_{e} = 2^{S(q,e)}`$. If each query matches at most one entity, the probability that $`e`$ is the match is
 
@@ -339,10 +341,10 @@ A pairwise posterior with prior $`\rho/N`$ would give E1 0.99998 and E3 0.996. B
 
 ### 9.5 A tie
 
-A second query gives only the address, 12 Main St, Denver. E1, E3 and E4 each score 14.41 bits ($`BF = 21,770`$). With only the address present, $`B_{0}(q) = 0.172`$. Then $`T_{q} = 3 \times 21,770 + 49,997 \times 0.172 = 73,850`$, and the denominator is $`1.7 \times 10^{- 5} \times 73,850 + 0.15 = 1.405`$, so
+A second query gives only the address, 12 Main St, Denver. E1, E3 and E4 each score 14.41 bits ($`BF = 21,770`$). With only the address present, $`B_{0}(q) = 0.172`$. Then $`T_{q} = 3 \times 21,770 + 49,997 \times 0.172 = 73,910`$, and the denominator is $`1.7 \times 10^{- 5} \times 73,910 + 0.15 = 1.406`$, so
 
 ``` math
-P(E1 \mid q) = P(E3 \mid q) = P(E4 \mid q) = \frac{1.7 \times 10^{- 5} \times 21,770}{1.405} = 0.263
+P(E1 \mid q) = P(E3 \mid q) = P(E4 \mid q) = \frac{1.7 \times 10^{- 5} \times 21,770}{1.406} = 0.263
 ```
 
 That leaves 0.211 for “none listed”. About 0.107 of that is the chance the company is not in the table at all. The remaining 0.104 is the chance that it is some other entity at the address that blocking did not reach. The ranked list shows a three-way tie. The top probability is below $`\tau_{\text{review}} = 0.5`$, so the decision is no match: one shared building address cannot identify a tenant.
